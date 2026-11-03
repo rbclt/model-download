@@ -1,0 +1,1 @@
+"create a application for bringing Llama model from Hugging face to Amazon S3 by importing it from Hugging Face to a common aws account and then scan for data leak.If data leak or eval fails then stop the process and clean up the resources and any artifacts downloaded and let the user know about the failure. This process should be triggered by an event."

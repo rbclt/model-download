@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools==84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "model-import-scan"
+version = "0.1.0"
+description = "Imports a public Hugging Face model, scans it for leaks, and keeps or removes it."
+requires-python = ">=3.12"
+dependencies = [
+    "boto3==1.43.123",
+    "botocore==1.43.123",
+    "httpx==0.28.1",
+]
+
+[project.scripts]
+model-import-worker = "model_import.worker:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "moto[s3,sqs,ses]==5.2.5",
+    "respx==0.23.1",
+    "black==26.10.1",
+    "ruff==0.17.3",
+    "pip-audit==2.10.1",
+    "aws-cdk-lib==2.275.0",
+    "constructs==10.8.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+addopts = "--import-mode=importlib"
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.coverage.run]
+source = ["src/model_import", "infra"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "infra"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]

@@ -1,0 +1,17 @@
+﻿{
+  "stage": "code-generation",
+  "unit": "u1-import-slice",
+  "version": 1,
+  "writes": [
+    { "path": "pyproject.toml" },
+    { "path": "README.md" },
+    { "path": "Dockerfile" },
+    { "path": ".dockerignore" },
+    { "path": "app.py" },
+    { "path": "cdk.json" },
+    { "path": ".gitignore" },
+    { "path": "src/model_import/" },
+    { "path": "infra/" },
+    { "path": "tests/" }
+  ]
+}

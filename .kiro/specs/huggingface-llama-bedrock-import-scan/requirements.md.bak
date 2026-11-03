@@ -1,0 +1,291 @@
+# Requirements Document
+
+## Introduction
+
+This feature defines an ordered, gated pipeline that brings a Llama model from Hugging Face into Amazon Bedrock. The pipeline runs in a shared ("common") AWS account and has six stages:
+
+1. **Intake**: a requester submits a Hugging Face model reference, pinned to an exact revision.
+2. **Download**: the model files are downloaded into an isolated quarantine S3 bucket.
+3. **Scan**: the files are scanned for malicious code and data leaks, with extra attention on metadata and configuration files.
+4. **Verdict**: the scan results are combined into a single pass, review, or fail verdict.
+5. **Promotion or rejection**: clean artifacts move to an approved S3 bucket. Failing artifacts stay in quarantine.
+6. **Import**: the approved artifacts are imported into Amazon Bedrock with Custom Model Import.
+
+Every stage uses least-privilege access and writes audit records. No stage may start until the previous stage has completed successfully.
+
+Scope notes:
+- Amazon Bedrock Custom Model Import reads Hugging Face weights in safetensors format together with `config.json` and the tokenizer files. The pipeline therefore accepts only safetensors weights and rejects pickle-based weight formats.
+- Scanning reduces risk but does not prove a model is safe. Model weights can still carry behavioral risks (for example backdoors) that file scanning cannot detect. This residual risk is out of scope for this feature.
+
+## Glossary
+
+- **Pipeline**: The orchestrated workflow that performs intake, download, scan, verdict, promotion or rejection, and Bedrock import.
+- **Orchestrator**: The component that runs the Pipeline stages in order and records the state of each Import_Request.
+- **Common_Account**: The shared AWS account that hosts the Pipeline, the Quarantine_Bucket, and the Approved_Bucket.
+- **Requester**: A person or system that submits an Import_Request.
+- **Reviewer**: An authorized person who reviews Findings with Warning severity and approves or rejects an Import_Request.
+- **Import_Request**: A record containing the Hugging Face repository ID, the pinned revision, the Requester identity, and the target Bedrock model name.
+- **Model_Source_Allowlist**: The configured list of Hugging Face organizations and repository IDs that the Pipeline may download.
+- **Pinned_Revision**: A full 40-character Hugging Face commit SHA that identifies one immutable version of a repository.
+- **Download_Worker**: The isolated compute component that downloads model files from Hugging Face.
+- **Quarantine_Bucket**: The S3 bucket that holds downloaded artifacts before and during scanning. Only the Download_Worker and the Scanner have access to the bucket.
+- **Approved_Bucket**: The S3 bucket that holds artifacts that received a Pass verdict or an approved Warning verdict.
+- **Artifact_Manifest**: A JSON document that lists every downloaded file with its path, size in bytes, and SHA-256 digest.
+- **Scanner**: The set of components that inspect artifacts in the Quarantine_Bucket. The Scanner includes the File_Type_Validator, Safetensors_Validator, Metadata_Scanner, Code_Scanner, Pickle_Scanner, Leak_Scanner, and Malware_Scanner.
+- **File_Type_Validator**: The Scanner component that checks each file against the File_Allowlist.
+- **File_Allowlist**: The configured list of permitted file names and extensions: `*.safetensors`, `model.safetensors.index.json`, `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `tokenizer.model`, `special_tokens_map.json`, `LICENSE*`, `USE_POLICY*`, and `README.md`.
+- **Safetensors_Validator**: The Scanner component that validates the structure of each `.safetensors` file.
+- **Metadata_Scanner**: The Scanner component that inspects `config.json`, `generation_config.json`, tokenizer files, `model.safetensors.index.json`, the safetensors `__metadata__` header section, and the model card.
+- **Code_Scanner**: The Scanner component that statically analyzes Python files, shell scripts, and notebooks.
+- **Pickle_Scanner**: The Scanner component that inspects pickle-based files (`.bin`, `.pt`, `.pth`, `.pkl`, `.ckpt`) for dangerous opcodes and imports.
+- **Leak_Scanner**: The Scanner component that detects secrets, credentials, personally identifiable information (PII), and embedded network locations in text content.
+- **Malware_Scanner**: The Scanner component that runs an antivirus or malware detection service against every file.
+- **Finding**: One result produced by a Scanner component, with a file path, rule ID, severity, and description.
+- **Severity**: One of Critical, High, Warning, or Info.
+- **Scan_Report**: A JSON document that contains all Findings, the Artifact_Manifest digest, the Scanner version, and the Verdict.
+- **Verdict**: The Orchestrator decision for an Import_Request: Pass, Review, or Fail.
+- **Bedrock_Importer**: The component that creates and monitors an Amazon Bedrock Custom Model Import job.
+- **Import_Role**: The IAM service role that Amazon Bedrock assumes to read the Approved_Bucket during a Custom Model Import job.
+- **Audit_Log**: The append-only record of Pipeline events, stored in CloudWatch Logs and an S3 bucket with Object Lock enabled.
+- **KMS_Key**: The AWS KMS customer managed key that encrypts the Quarantine_Bucket, the Approved_Bucket, the Scan_Report, and the Audit_Log.
+
+## Requirements
+
+### Requirement 1: Intake and Source Validation
+
+**User Story:** As a security engineer, I want every import to start from a validated, pinned request, so that only approved and reproducible model versions enter the Pipeline.
+
+#### Acceptance Criteria
+
+1. WHEN a Requester submits an Import_Request, THE Orchestrator SHALL record the repository ID, the Pinned_Revision, the Requester identity, the target Bedrock model name, and a UTC timestamp.
+2. IF the repository ID in an Import_Request is not in the Model_Source_Allowlist, THEN THE Orchestrator SHALL reject the Import_Request and record the rejection reason in the Audit_Log.
+3. IF the revision in an Import_Request is not a 40-character hexadecimal commit SHA, THEN THE Orchestrator SHALL reject the Import_Request and return an error that identifies the invalid revision.
+4. IF the Hugging Face repository is gated and the Common_Account has no recorded acceptance of the Llama license for the repository, THEN THE Orchestrator SHALL reject the Import_Request and record that license acceptance is missing.
+5. WHEN an Import_Request passes validation, THE Orchestrator SHALL assign a unique Import_Request ID and set the state to `INTAKE_ACCEPTED`.
+6. WHEN an Import_Request is submitted with a repository ID and Pinned_Revision that match an existing Import_Request in state `IMPORTED`, THE Orchestrator SHALL return the existing Import_Request ID without starting a new download.
+
+### Requirement 2: Isolated Download into Quarantine
+
+**User Story:** As a security engineer, I want downloads to happen in an isolated environment and land only in a quarantine bucket, so that untrusted files cannot reach any other system before they are scanned.
+
+#### Acceptance Criteria
+
+1. WHEN an Import_Request is in state `INTAKE_ACCEPTED`, THE Download_Worker SHALL download the files of the Pinned_Revision from Hugging Face and write them under the prefix `quarantine/{import_request_id}/` in the Quarantine_Bucket.
+2. THE Download_Worker SHALL run in a private subnet with no inbound access and with outbound access limited to the Hugging Face domains configured for the Pipeline.
+3. THE Download_Worker SHALL read the Hugging Face access token from AWS Secrets Manager at the start of each download and SHALL NOT write the token to disk, to the Audit_Log, or to the Quarantine_Bucket.
+4. THE Download_Worker SHALL write each downloaded file to the Quarantine_Bucket without executing, importing, or loading the file contents.
+5. WHEN the download completes, THE Download_Worker SHALL generate an Artifact_Manifest that lists every downloaded file with its size and SHA-256 digest, and SHALL store the Artifact_Manifest under the same prefix.
+6. WHEN the download completes, THE Orchestrator SHALL set the state to `DOWNLOADED`.
+7. IF the download fails or does not complete within 4 hours, THEN THE Orchestrator SHALL set the state to `DOWNLOAD_FAILED`, record the failure reason in the Audit_Log, and delete the partial files under the quarantine prefix.
+8. IF the total size of the downloaded files exceeds the configured maximum download size, THEN THE Download_Worker SHALL stop the download and THE Orchestrator SHALL set the state to `DOWNLOAD_FAILED`.
+
+### Requirement 3: File Allowlist and Weight Format Enforcement
+
+**User Story:** As a security engineer, I want only expected, non-executable file types to be accepted, so that custom code and pickle payloads are blocked before deeper scanning.
+
+#### Acceptance Criteria
+
+1. WHEN an Import_Request is in state `DOWNLOADED`, THE File_Type_Validator SHALL compare every file in the Artifact_Manifest against the File_Allowlist.
+2. IF a file is not in the File_Allowlist, THEN THE File_Type_Validator SHALL record a Finding with Severity High that names the file.
+3. IF a file has the extension `.py`, `.sh`, `.bat`, `.ps1`, `.so`, `.dll`, `.exe`, `.ipynb`, or `.jar`, THEN THE File_Type_Validator SHALL record a Finding with Severity Critical that names the file.
+4. IF a file has the extension `.bin`, `.pt`, `.pth`, `.pkl`, `.pickle`, or `.ckpt`, THEN THE File_Type_Validator SHALL record a Finding with Severity Critical that names the file.
+5. IF the Artifact_Manifest contains no `.safetensors` file, THEN THE File_Type_Validator SHALL record a Finding with Severity Critical that states weights in safetensors format are missing.
+6. WHEN a file's extension does not match its detected content type, THE File_Type_Validator SHALL record a Finding with Severity High that names the file and both types.
+7. WHEN the SHA-256 digest of a file in the Quarantine_Bucket differs from the digest in the Artifact_Manifest, THE File_Type_Validator SHALL record a Finding with Severity Critical that names the file.
+
+### Requirement 4: Safetensors Structure Validation
+
+**User Story:** As a security engineer, I want weight files to be structurally validated without being deserialized by code, so that malformed or disguised files are detected.
+
+#### Acceptance Criteria
+
+1. WHEN a `.safetensors` file is scanned, THE Safetensors_Validator SHALL read the 8-byte little-endian header length and the JSON header without loading tensor data into a Python object graph.
+2. IF the declared header length exceeds the file size or exceeds the configured maximum header size, THEN THE Safetensors_Validator SHALL record a Finding with Severity Critical.
+3. IF the header is not valid JSON, THEN THE Safetensors_Validator SHALL record a Finding with Severity Critical.
+4. IF any tensor entry has a `data_offsets` range that lies outside the data section or overlaps another tensor entry, THEN THE Safetensors_Validator SHALL record a Finding with Severity Critical.
+5. WHEN the header contains a `__metadata__` section, THE Safetensors_Validator SHALL pass the key-value strings to the Metadata_Scanner and the Leak_Scanner.
+6. WHEN `model.safetensors.index.json` is present, THE Safetensors_Validator SHALL verify that every shard file named in `weight_map` exists in the Artifact_Manifest and SHALL record a Finding with Severity High for each missing shard.
+
+### Requirement 5: Metadata and Configuration Scanning
+
+**User Story:** As a security engineer, I want metadata and configuration files inspected for dangerous settings and hidden payloads, so that code-execution hooks and tampered settings are caught.
+
+#### Acceptance Criteria
+
+1. WHEN `config.json` is scanned, THE Metadata_Scanner SHALL parse the file as strict JSON and record a Finding with Severity Critical if parsing fails.
+2. IF `config.json` contains an `auto_map` key, THEN THE Metadata_Scanner SHALL record a Finding with Severity Critical that names the referenced modules.
+3. IF any metadata file contains the key `trust_remote_code` with a true value, THEN THE Metadata_Scanner SHALL record a Finding with Severity Critical.
+4. IF the `architectures` value in `config.json` does not match the list of Llama architectures supported by Amazon Bedrock Custom Model Import, THEN THE Metadata_Scanner SHALL record a Finding with Severity High that names the architecture.
+5. IF `config.json` contains a key that is not in the configured set of known Llama configuration keys, THEN THE Metadata_Scanner SHALL record a Finding with Severity Warning that names the key.
+6. WHEN `tokenizer_config.json`, `tokenizer.json`, or `special_tokens_map.json` is scanned, THE Metadata_Scanner SHALL record a Finding with Severity High for each string value that contains template-execution constructs outside the standard chat template syntax, or that contains a URL, a shell command, or a Python expression.
+7. WHEN `generation_config.json` is scanned, THE Metadata_Scanner SHALL record a Finding with Severity Warning for each key that is not a recognized Hugging Face generation parameter.
+8. WHEN a metadata file contains a string value longer than the configured maximum string length, THE Metadata_Scanner SHALL record a Finding with Severity Warning that names the file and the key path.
+9. WHEN a metadata file contains a string value with Base64, hexadecimal, or compressed content that decodes to executable code or to a script, THE Metadata_Scanner SHALL record a Finding with Severity Critical.
+10. WHEN the model card (`README.md`) is scanned, THE Metadata_Scanner SHALL record a Finding with Severity Warning for each embedded URL, each HTML `script` or `iframe` element, and each shell command inside a fenced code block that pipes network content into a shell.
+
+### Requirement 6: Malicious Code Detection
+
+**User Story:** As a security engineer, I want any code or code-like content analyzed statically, so that malicious scripts are detected without being executed.
+
+#### Acceptance Criteria
+
+1. WHEN a Python file, shell script, or notebook is present in the Quarantine_Bucket, THE Code_Scanner SHALL analyze the file by static analysis and SHALL NOT execute or import the file.
+2. WHEN the Code_Scanner finds a call to `eval`, `exec`, `compile`, `os.system`, `subprocess`, `socket`, `requests`, `urllib`, `http.client`, `ctypes`, or `pickle.loads`, THE Code_Scanner SHALL record a Finding with Severity High that names the file, line number, and call.
+3. WHEN the Code_Scanner finds a Base64-decoded or obfuscated string that is passed to an execution function, THE Code_Scanner SHALL record a Finding with Severity Critical.
+4. WHEN the Code_Scanner finds a reference to AWS credential locations, environment variables that contain `KEY`, `TOKEN`, or `SECRET`, or the instance metadata endpoint `169.254.169.254`, THE Code_Scanner SHALL record a Finding with Severity Critical.
+5. IF the Code_Scanner cannot parse a file, THEN THE Code_Scanner SHALL record a Finding with Severity High that states the file could not be analyzed.
+
+### Requirement 7: Pickle Payload Detection
+
+**User Story:** As a security engineer, I want any pickle-based file inspected at the opcode level, so that deserialization attacks are identified even if the file passes the allowlist step.
+
+#### Acceptance Criteria
+
+1. WHEN a pickle-based file is present in the Quarantine_Bucket, THE Pickle_Scanner SHALL inspect the opcode stream without unpickling the file.
+2. WHEN the opcode stream contains a `GLOBAL`, `STACK_GLOBAL`, or `REDUCE` operation that references a module or callable outside the configured safe-callable list, THE Pickle_Scanner SHALL record a Finding with Severity Critical that names the module and callable.
+3. WHEN a `.bin` or `.pt` file is a ZIP archive, THE Pickle_Scanner SHALL inspect each embedded `data.pkl` file under the same rules.
+4. IF the Pickle_Scanner cannot parse a file, THEN THE Pickle_Scanner SHALL record a Finding with Severity High that states the file could not be analyzed.
+
+### Requirement 8: Data Leak Detection
+
+**User Story:** As a security engineer, I want all text content scanned for secrets, PII, and embedded network locations, so that sensitive data is not carried into the Bedrock environment.
+
+#### Acceptance Criteria
+
+1. WHEN the Leak_Scanner scans a text file or a metadata string, THE Leak_Scanner SHALL check the content against rules for AWS access keys, private keys, Hugging Face tokens, GitHub tokens, JWTs, and generic high-entropy credential strings.
+2. WHEN the Leak_Scanner detects a secret, THE Leak_Scanner SHALL record a Finding with Severity Critical that names the file, location, and rule ID.
+3. WHEN the Leak_Scanner detects a secret, THE Leak_Scanner SHALL store only a redacted form of the matched value that reveals at most the first 4 characters.
+4. WHEN the Leak_Scanner detects an email address, phone number, or government identifier pattern, THE Leak_Scanner SHALL record a Finding with Severity Warning.
+5. WHEN the Leak_Scanner detects a private IP address, an internal hostname, or a URL whose domain is not in the configured trusted-domain list, THE Leak_Scanner SHALL record a Finding with Severity Warning that names the value and location.
+6. THE Leak_Scanner SHALL scan the text content of every file in the Artifact_Manifest that has a text, JSON, or Markdown content type, and SHALL scan the string values in the safetensors `__metadata__` section.
+
+### Requirement 9: Malware Detection
+
+**User Story:** As a security engineer, I want every artifact checked by a malware detection service, so that known malicious binaries are caught in addition to the custom rules.
+
+#### Acceptance Criteria
+
+1. WHEN an Import_Request is in state `DOWNLOADED`, THE Malware_Scanner SHALL scan every object under the quarantine prefix with a malware detection service.
+2. WHEN the malware detection service reports a threat for an object, THE Malware_Scanner SHALL record a Finding with Severity Critical that names the object and the threat name.
+3. IF the malware detection service is unavailable or returns an error for an object, THEN THE Malware_Scanner SHALL record a Finding with Severity High that names the object.
+4. THE Malware_Scanner SHALL record the malware definition version used for each scan in the Scan_Report.
+
+### Requirement 10: Scan Report and Verdict
+
+**User Story:** As a reviewer, I want one consolidated report and a clear verdict, so that the promotion decision is consistent and explainable.
+
+#### Acceptance Criteria
+
+1. WHEN all Scanner components have completed for an Import_Request, THE Orchestrator SHALL generate a Scan_Report in JSON that contains every Finding, the SHA-256 digest of the Artifact_Manifest, the Scanner version, the malware definition version, and the Verdict.
+2. IF the Scan_Report contains at least one Finding with Severity Critical or High, THEN THE Orchestrator SHALL set the Verdict to Fail.
+3. IF the Scan_Report contains no Finding with Severity Critical or High and at least one Finding with Severity Warning, THEN THE Orchestrator SHALL set the Verdict to Review.
+4. IF the Scan_Report contains no Finding with Severity Critical, High, or Warning, THEN THE Orchestrator SHALL set the Verdict to Pass.
+5. IF any Scanner component fails to complete, THEN THE Orchestrator SHALL set the Verdict to Fail and record the failing component in the Scan_Report.
+6. THE Orchestrator SHALL store the Scan_Report encrypted with the KMS_Key under `reports/{import_request_id}/scan-report.json`.
+7. THE Orchestrator SHALL serialize the Scan_Report to JSON in a format that a Scan_Report parser can read back into an equivalent Scan_Report object.
+8. FOR ALL valid Scan_Report objects, serializing, parsing, and serializing again SHALL produce a document equivalent to the first serialized document (round-trip property).
+9. IF a Scan_Report JSON document does not conform to the Scan_Report schema, THEN THE Scan_Report parser SHALL return an error that names the first invalid field.
+
+### Requirement 11: Review of Warning Findings
+
+**User Story:** As a reviewer, I want to approve or reject models that only have low-severity Findings, so that human judgment is applied before promotion.
+
+#### Acceptance Criteria
+
+1. WHEN the Verdict is Review, THE Orchestrator SHALL set the state to `AWAITING_REVIEW` and notify the Reviewer group with the Import_Request ID and a link to the Scan_Report.
+2. WHEN a Reviewer approves an Import_Request in state `AWAITING_REVIEW`, THE Orchestrator SHALL record the Reviewer identity, the decision, a justification text, and a UTC timestamp in the Audit_Log and SHALL set the state to `APPROVED`.
+3. WHEN a Reviewer rejects an Import_Request in state `AWAITING_REVIEW`, THE Orchestrator SHALL record the Reviewer identity and justification in the Audit_Log and SHALL set the state to `REJECTED`.
+4. IF the Reviewer identity is the same as the Requester identity, THEN THE Orchestrator SHALL refuse the decision and record the refusal in the Audit_Log.
+5. IF no Reviewer decision is recorded within 14 days, THEN THE Orchestrator SHALL set the state to `REJECTED` and record the timeout in the Audit_Log.
+6. IF the Verdict is Fail, THEN THE Orchestrator SHALL NOT accept a Reviewer approval for the Import_Request.
+
+### Requirement 12: Promotion of Clean Artifacts
+
+**User Story:** As a platform owner, I want only verified artifacts copied to an approved location, so that Bedrock never reads from the quarantine area.
+
+#### Acceptance Criteria
+
+1. WHEN the Verdict is Pass, or the state is `APPROVED`, THE Orchestrator SHALL verify that the SHA-256 digest of every quarantined file matches the Artifact_Manifest immediately before copying.
+2. WHEN the digest verification succeeds, THE Orchestrator SHALL copy only the files named in the File_Allowlist to the prefix `approved/{import_request_id}/` in the Approved_Bucket.
+3. WHEN the copy completes, THE Orchestrator SHALL verify that the SHA-256 digest of each copied file equals the digest in the Artifact_Manifest and SHALL set the state to `PROMOTED`.
+4. IF a digest verification fails before or after the copy, THEN THE Orchestrator SHALL delete the copied files from the Approved_Bucket, set the state to `PROMOTION_FAILED`, and record the file name in the Audit_Log.
+5. THE Approved_Bucket SHALL deny write access to every principal other than the promotion role of the Orchestrator.
+
+### Requirement 13: Quarantine and Rejection Handling
+
+**User Story:** As a security engineer, I want failed models contained, reported, and eventually deleted, so that malicious files stay isolated and are not retained indefinitely.
+
+#### Acceptance Criteria
+
+1. WHEN the Verdict is Fail or the state is `REJECTED`, THE Orchestrator SHALL keep the artifacts under the quarantine prefix, apply an S3 object tag `scan-status=failed`, and set the state to `QUARANTINED`.
+2. WHEN the state is set to `QUARANTINED`, THE Orchestrator SHALL notify the security team with the Import_Request ID, the count of Findings per Severity, and a link to the Scan_Report.
+3. WHILE an Import_Request is in state `QUARANTINED`, THE Orchestrator SHALL deny every request to start a Bedrock import for that Import_Request.
+4. WHEN a quarantined Import_Request is 30 days old, THE Orchestrator SHALL delete the artifacts under the quarantine prefix and record the deletion in the Audit_Log.
+5. WHERE the security team places a legal-hold tag on an Import_Request, THE Orchestrator SHALL skip the deletion until the tag is removed.
+6. WHEN an Import_Request reaches a terminal state, THE Orchestrator SHALL delete any temporary compute resources used for that Import_Request.
+
+### Requirement 14: Bedrock Custom Model Import
+
+**User Story:** As an ML platform engineer, I want approved artifacts imported into Amazon Bedrock automatically, so that the model is available for inference through Bedrock.
+
+#### Acceptance Criteria
+
+1. WHEN the state is `PROMOTED`, THE Bedrock_Importer SHALL create an Amazon Bedrock Custom Model Import job whose model data source is the S3 prefix `approved/{import_request_id}/` in the Approved_Bucket.
+2. THE Bedrock_Importer SHALL set the import job role to the Import_Role and SHALL name the imported model with the target model name from the Import_Request.
+3. WHEN the import job is created, THE Bedrock_Importer SHALL set the state to `IMPORTING` and poll the job status at an interval of 60 seconds.
+4. WHEN the import job reports status Completed, THE Bedrock_Importer SHALL record the imported model ARN in the Import_Request and set the state to `IMPORTED`.
+5. IF the import job reports status Failed, THEN THE Bedrock_Importer SHALL record the failure message in the Audit_Log and set the state to `IMPORT_FAILED`.
+6. IF the import job does not reach a terminal status within 6 hours, THEN THE Bedrock_Importer SHALL set the state to `IMPORT_FAILED` and record the timeout in the Audit_Log.
+7. WHEN the state is `IMPORTED`, THE Bedrock_Importer SHALL tag the imported model with the Import_Request ID, the repository ID, the Pinned_Revision, and the Verdict.
+8. WHEN the state is `IMPORTED`, THE Bedrock_Importer SHALL send one test inference request to the imported model and record whether the request returned a response with a success status.
+9. IF the Bedrock_Importer is asked to start an import for an Import_Request whose state is not `PROMOTED`, THEN THE Bedrock_Importer SHALL refuse the request and record the refusal in the Audit_Log.
+
+### Requirement 15: Least-Privilege Access Control
+
+**User Story:** As a security engineer, I want each component limited to the minimum permissions it needs, so that a compromised stage cannot reach resources outside its role.
+
+#### Acceptance Criteria
+
+1. THE Common_Account SHALL define a separate IAM role for each of the Orchestrator, Download_Worker, Scanner, promotion step, Bedrock_Importer, and Import_Role.
+2. THE Download_Worker role SHALL permit `s3:PutObject` only on the quarantine prefix and SHALL permit `secretsmanager:GetSecretValue` only on the Hugging Face token secret.
+3. THE Scanner role SHALL permit read access to the Quarantine_Bucket and write access only to the report prefix.
+4. THE Import_Role SHALL permit read access only on the Approved_Bucket prefix `approved/{import_request_id}/` and SHALL have a trust policy that allows only the Amazon Bedrock service principal, with `aws:SourceAccount` and `aws:SourceArn` conditions.
+5. THE Quarantine_Bucket and the Approved_Bucket SHALL enable S3 Block Public Access, enforce TLS in the bucket policy, and encrypt objects with the KMS_Key.
+6. THE Common_Account SHALL grant the Requester role permission to create Import_Requests only, and SHALL grant no Requester role permission to read the Quarantine_Bucket.
+7. THE Common_Account SHALL grant no role other than the promotion role write access to the Approved_Bucket.
+
+### Requirement 16: Audit Logging
+
+**User Story:** As an auditor, I want a complete, tamper-resistant record of every Pipeline action, so that I can trace who imported which model and why it was approved.
+
+#### Acceptance Criteria
+
+1. WHEN an Import_Request changes state, THE Orchestrator SHALL write an Audit_Log record that contains the Import_Request ID, the previous state, the new state, the actor identity, and a UTC timestamp.
+2. THE Audit_Log SHALL record every download, scan start, scan completion, Verdict, review decision, promotion, quarantine, deletion, and Bedrock import event.
+3. THE Audit_Log SHALL be stored in an S3 bucket with Object Lock in compliance mode and a configured retention period of at least 365 days.
+4. THE Common_Account SHALL enable AWS CloudTrail for S3 data events on the Quarantine_Bucket and the Approved_Bucket and for Amazon Bedrock management events.
+5. IF writing an Audit_Log record fails, THEN THE Orchestrator SHALL stop the Import_Request in its current state and raise an alarm.
+6. THE Audit_Log SHALL contain no secret values, access tokens, or unredacted Finding values.
+
+### Requirement 17: Ordered and Resumable Execution
+
+**User Story:** As an operator, I want the stages to run strictly in order and to be safely re-runnable, so that a failure never lets an unscanned artifact reach Bedrock.
+
+#### Acceptance Criteria
+
+1. THE Orchestrator SHALL permit only the state transitions in this order: `INTAKE_ACCEPTED`, `DOWNLOADED`, `SCANNED`, then `PROMOTED` or `QUARANTINED`, then `IMPORTING`, then `IMPORTED`, with `AWAITING_REVIEW` and `APPROVED` permitted between `SCANNED` and `PROMOTED`.
+2. IF a component requests a state transition that is not permitted, THEN THE Orchestrator SHALL reject the transition and record the rejection in the Audit_Log.
+3. WHEN a stage fails with a transient error, THE Orchestrator SHALL retry the stage up to 3 times with exponential backoff before setting a failed state.
+4. WHEN a stage is re-run for the same Import_Request ID, THE Orchestrator SHALL produce the same resulting state and the same objects as a single run of that stage (idempotence).
+5. IF the Pinned_Revision files in the Quarantine_Bucket change after the Scan_Report is generated, THEN THE Orchestrator SHALL invalidate the Verdict and require a new scan.
+6. WHEN an Import_Request enters a failed state, THE Orchestrator SHALL send an alarm notification to the operations group.
+
+### Requirement 18: Operator Visibility
+
+**User Story:** As an operator, I want to see the status and results of every import, so that I can follow progress and answer questions from requesters.
+
+#### Acceptance Criteria
+
+1. WHEN a Requester or Reviewer queries an Import_Request ID, THE Orchestrator SHALL return the current state, the state history, and the Verdict.
+2. WHEN a Requester or Reviewer queries the Findings of an Import_Request, THE Orchestrator SHALL return the Findings with redacted values and without access to the quarantined file contents.
+3. THE Orchestrator SHALL publish metrics for the count of Import_Requests per state, the scan duration, and the count of Findings per Severity.

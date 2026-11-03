@@ -1,0 +1,8 @@
+# The image needs only pyproject.toml and src/. Everything else stays out of the build context
+# (and out of the CDK asset hash).
+*
+!pyproject.toml
+!src/
+**/__pycache__
+**/*.pyc
+**/*.egg-info

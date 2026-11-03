@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Model Import and Scan - MVP Handover</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 20mm 16mm; @bottom-center { content: "Model Import and Scan - MVP handover   |   page " counter(page); font-size: 8pt; color: #666; } }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, Helvetica, sans-serif; font-size: 10pt; line-height: 1.45; color: #1c1c1c; }
+  h1 { font-size: 24pt; margin: 0 0 4pt 0; color: #0b3d62; }
+  h2 { font-size: 15pt; color: #0b3d62; border-bottom: 2px solid #0b3d62; padding-bottom: 2pt; margin: 22pt 0 8pt 0; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; color: #0b3d62; margin: 14pt 0 4pt 0; page-break-after: avoid; }
+  p { margin: 4pt 0 6pt 0; }
+  ul, ol { margin: 4pt 0 8pt 0; padding-left: 18pt; }
+  li { margin: 2pt 0; }
+  code { font-family: Consolas, "Courier New", monospace; font-size: 8.8pt; background: #f1f3f5; padding: 0 2pt; border-radius: 2pt; }
+  pre { font-family: Consolas, "Courier New", monospace; font-size: 8.4pt; background: #f1f3f5; border: 1px solid #d9dde1; border-radius: 3pt; padding: 6pt 8pt; white-space: pre-wrap; word-wrap: break-word; page-break-inside: avoid; margin: 4pt 0 8pt 0; }
+  table { border-collapse: collapse; width: 100%; margin: 4pt 0 10pt 0; font-size: 9pt; }
+  th { background: #0b3d62; color: #fff; text-align: left; padding: 4pt 5pt; }
+  td { border: 1px solid #cfd4d9; padding: 3.5pt 5pt; vertical-align: top; }
+  tr { page-break-inside: avoid; }
+  tr:nth-child(even) td { background: #f7f9fa; }
+  .cover { page-break-after: always; padding-top: 60mm; }
+  .cover .sub { font-size: 13pt; color: #444; margin-bottom: 26pt; }
+  .cover table { width: 70%; font-size: 10pt; }
+  .note { border-left: 4px solid #d98b00; background: #fff6e5; padding: 6pt 9pt; margin: 8pt 0; page-break-inside: avoid; }
+  .ok { border-left: 4px solid #2c8a3d; background: #eaf6ec; padding: 6pt 9pt; margin: 8pt 0; page-break-inside: avoid; }
+  .warn { border-left: 4px solid #b3261e; background: #fdeceb; padding: 6pt 9pt; margin: 8pt 0; page-break-inside: avoid; }
+  .toc { page-break-after: always; }
+  .toc ol { line-height: 1.8; font-size: 11pt; }
+  .small { font-size: 8.5pt; color: #555; }
+  svg { max-width: 100%; page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<!-- ============================ COVER ============================ -->
+<div class="cover">
+  <h1>Model Import and Scan</h1>
+  <div class="sub">MVP handover documentation: install, code, package, deploy, operate</div>
+  <table>
+    <tr><th style="width:35%">Item</th><th>Value</th></tr>
+    <tr><td>Version</td><td>0.1.0 (MVP, <code>pyproject.toml</code>)</td></tr>
+    <tr><td>Date</td><td>2 November 2026</td></tr>
+    <tr><td>Code location</td><td><code>c:\Roshin\Kiro\Projects\model-download-scan</code> (not yet in Git)</td></tr>
+    <tr><td>Language and tools</td><td>Python 3.12 target, AWS CDK v2 (Python), Docker, AWS Fargate</td></tr>
+    <tr><td>AWS Region</td><td>us-east-1</td></tr>
+    <tr><td>Status</td><td>Code complete and tested locally (540 tests, 95.88% coverage). <b>Never deployed or run against a real AWS account.</b></td></tr>
+  </table>
+  <p class="small">Built with the AI-DLC workflow (scope <code>mvp</code>, two Units). The design and review records are in the <code>aidlc/</code> folder of the project. Every statement here was taken from the code, the README, or those records. Section 11 lists what has not been verified.</p>
+</div>
+
+<!-- ============================ TOC ============================ -->
+<div class="toc">
+  <h2 style="margin-top:0">Contents</h2>
+  <ol>
+    <li>What the MVP does</li>
+    <li>How it works (architecture and flow)</li>
+    <li>Where everything is (code map)</li>
+    <li>Inputs: the start event, the model limits, the deployment settings</li>
+    <li>What the scan checks</li>
+    <li>Prerequisites before the first deployment</li>
+    <li>Install and check the code on a developer machine</li>
+    <li>Package and deploy</li>
+    <li>Run it: send an event and read the results</li>
+    <li>Operate: alerts, logs, records, and recovery</li>
+    <li>What has not been verified, known limits, and open items</li>
+    <li>Reference: limits and names at a glance; where the design records are</li>
+  </ol>
+</div>
+
+<!-- ============================ 1 ============================ -->
+<h2>1. What the MVP does</h2>
+<p>The application brings an open-weight model from the public Hugging Face site into your own Amazon S3 bucket, but only after it has been scanned for leaked secrets and personal data. It is event driven: nothing runs until an event names a model.</p>
+<ol>
+  <li>A person or system puts an event on the <code>model-import</code> Amazon EventBridge bus. The event names a model (<code>owner/name</code>), an exact version (a 40-character commit hash), and the sender's email address.</li>
+  <li>A worker running on AWS Fargate downloads every file of that version into a <b>holding</b> S3 bucket.</li>
+  <li>The worker scans the files. Text and settings files are searched for secrets and personal data. Weight files are checked by their file type and, for <code>.safetensors</code>, by their header.</li>
+  <li>A <b>clean</b> model is copied into the <b>final</b> S3 bucket. A <code>_COMPLETE</code> marker file is written last, so a model is complete only when the marker exists.</li>
+  <li>If a download fails, the scan finds anything, the 6-hour limit passes, or the copy fails, everything the import created is <b>removed</b> and an email goes to the team mailbox and to the sender.</li>
+</ol>
+<p>Every event ends in exactly one of five outcomes: <code>stored</code>, <code>removed-with-email</code>, <code>removed-email-failed</code>, <code>rejected</code>, or <code>refused-already-stored</code> (section 10).</p>
+<p>Scope of this first version: public models only (no Hugging Face account or token), smaller models (up to 1,000 files and 20 GB; the typical case is about 16 GB), one import at a time, one environment (<code>staging</code>) in one AWS account and Region.</p>
+
+<div class="warn"><b>Read this first.</b> The code and its automated tests are complete, but the application has <b>never been deployed</b>, the container image has never been built, and no real model, real AWS service, or real email has been used. The tests use stand-ins for S3, SQS, SES, and Hugging Face. Plan for a careful first deployment with a small model (section 8 and section 11).</div>
+
+<!-- ============================ 2 ============================ -->
+<h2>2. How it works (architecture and flow)</h2>
+
+<svg viewBox="0 0 760 330" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Segoe UI, Arial" font-size="11">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0b3d62"/></marker></defs>
+  <rect x="5" y="120" width="105" height="50" rx="6" fill="#e8f1f8" stroke="#0b3d62"/><text x="57" y="142" text-anchor="middle">Sender</text><text x="57" y="157" text-anchor="middle" font-size="9">puts event</text>
+  <rect x="140" y="120" width="120" height="50" rx="6" fill="#e8f1f8" stroke="#0b3d62"/><text x="200" y="141" text-anchor="middle">EventBridge bus</text><text x="200" y="156" text-anchor="middle" font-size="9">model-import / rule start-import</text>
+  <rect x="290" y="120" width="120" height="50" rx="6" fill="#e8f1f8" stroke="#0b3d62"/><text x="350" y="141" text-anchor="middle">SQS FIFO queue</text><text x="350" y="156" text-anchor="middle" font-size="9">import-queue.fifo</text>
+  <rect x="440" y="100" width="150" height="90" rx="6" fill="#fff3d6" stroke="#b07600"/><text x="515" y="120" text-anchor="middle" font-weight="bold">Worker (ECS Fargate)</text><text x="515" y="136" text-anchor="middle" font-size="9">service import-worker, 0 to 1 task</text><text x="515" y="150" text-anchor="middle" font-size="9">4 vCPU, 8 GiB, 30 GiB disk</text><text x="515" y="164" text-anchor="middle" font-size="9">download, scan, keep or remove</text><text x="515" y="178" text-anchor="middle" font-size="9">container from the Dockerfile</text>
+  <rect x="640" y="20" width="115" height="50" rx="6" fill="#eef7ee" stroke="#2c8a3d"/><text x="697" y="41" text-anchor="middle">Hugging Face</text><text x="697" y="56" text-anchor="middle" font-size="9">public files over HTTPS</text>
+  <rect x="610" y="115" width="145" height="40" rx="6" fill="#eef7ee" stroke="#2c8a3d"/><text x="682" y="132" text-anchor="middle">Holding S3 bucket</text><text x="682" y="146" text-anchor="middle" font-size="9">holding/ and state/</text>
+  <rect x="610" y="165" width="145" height="40" rx="6" fill="#eef7ee" stroke="#2c8a3d"/><text x="682" y="182" text-anchor="middle">Final S3 bucket</text><text x="682" y="196" text-anchor="middle" font-size="9">models/.../_COMPLETE</text>
+  <rect x="610" y="215" width="145" height="40" rx="6" fill="#eef7ee" stroke="#2c8a3d"/><text x="682" y="232" text-anchor="middle">Amazon SES</text><text x="682" y="246" text-anchor="middle" font-size="9">email to team and sender</text>
+  <rect x="440" y="250" width="150" height="48" rx="6" fill="#f3e8f8" stroke="#6a2c8a"/><text x="515" y="270" text-anchor="middle">CloudWatch Logs + alarms</text><text x="515" y="286" text-anchor="middle" font-size="9">then SNS topic model-import-alerts</text>
+  <rect x="290" y="230" width="120" height="48" rx="6" fill="#f3e8f8" stroke="#6a2c8a"/><text x="350" y="250" text-anchor="middle">Dead-letter queues</text><text x="350" y="265" text-anchor="middle" font-size="9">import-dlq.fifo, event-dlq</text>
+  <path d="M110,145 L138,145" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M260,145 L288,145" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M410,145 L438,145" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M590,130 L608,60" stroke="#2c8a3d" marker-end="url(#a)" fill="none" stroke-dasharray="3,2"/>
+  <path d="M590,135 L608,135" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M590,170 L608,182" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M590,185 L608,232" stroke="#0b3d62" marker-end="url(#a)" fill="none"/>
+  <path d="M515,190 L515,248" stroke="#6a2c8a" marker-end="url(#a)" fill="none"/>
+  <path d="M350,170 L350,228" stroke="#6a2c8a" marker-end="url(#a)" fill="none" stroke-dasharray="3,2"/>
+  <text x="380" y="215" font-size="9" fill="#6a2c8a">failed messages</text>
+  <text x="5" y="60" font-size="9" fill="#444">Alarm "scale-out" starts the worker when a message waits;</text>
+  <text x="5" y="73" font-size="9" fill="#444">alarm "scale-in" stops it after 5 idle minutes.</text>
+</svg>
+
+<h3>The life of one import</h3>
+<ol>
+  <li><b>Start event.</b> The bus rule <code>start-import</code> sends events with <code>source = model.import</code> and <code>detail-type = ModelImportRequested</code> to the FIFO queue. The queue hands out one message at a time, so imports never overlap.</li>
+  <li><b>Worker starts.</b> An alarm notices a waiting message and sets the Fargate service to 1 task (about 3 minutes). The worker receives the message, keeps it alive with a heartbeat every 5 minutes, and sets task protection so the platform does not stop it mid-import.</li>
+  <li><b>Check the event.</b> A bad event is rejected: nothing is downloaded and the team (and the sender, if the address is well formed) gets an email that names each failed field, never its value.</li>
+  <li><b>Front door.</b> If the outcome already exists, nothing is done. If a <code>_COMPLETE</code> marker for this model version already exists from another import, the event is refused (<code>refused-already-stored</code>).</li>
+  <li><b>6-hour clock starts</b> when the worker takes the event off the queue (queue waiting time does not count).</li>
+  <li><b>Download</b> the file list from Hugging Face, check the limits (at most 1,000 files and 20 GiB), then download up to 4 files in parallel to <code>holding/&lt;importId&gt;/</code>. Each download is checked for size and hash, and retried up to 3 times (waits of 5, 10, 20 seconds; at most 30 minutes of waiting in total).</li>
+  <li><b>Scan</b> (section 5). Any finding fails the whole import.</li>
+  <li><b>Keep.</b> Copy every file server-side to <code>models/&lt;owner/name, lowercase&gt;/&lt;version&gt;/</code>, write <code>_COMPLETE</code> last, then empty the holding folder. Once the marker is written, nothing can undo the model.</li>
+  <li><b>Remove</b> (on failure). Delete the marker first (if it is this import's), then every file the import created, then list again to prove nothing is left. Anything still found is reported as a "leftover".</li>
+  <li><b>Finish.</b> Email (on failure), one <code>import_outcome</code> log line, the one-time outcome object, and the final record. The message is deleted from the queue only after the outcome exists.</li>
+</ol>
+
+<h3>AWS resources created by the CDK stack</h3>
+<p>One CDK stack (default name <code>staging</code>) in one account and Region (us-east-1). Names marked "fixed" are the same in every deployment, so only one stack fits in an account and Region.</p>
+<table>
+  <tr><th style="width:27%">Resource</th><th>Name / setting</th><th style="width:30%">Purpose</th></tr>
+  <tr><td>EventBridge bus and rule</td><td><code>model-import</code> (fixed), rule <code>start-import</code>; accepts events only from principals of this account</td><td>Start events</td></tr>
+  <tr><td>SQS FIFO queue</td><td><code>import-queue.fifo</code>; visibility 15 min; one receive, then to the dead-letter queue; encrypted</td><td>One import at a time</td></tr>
+  <tr><td>Dead-letter queues</td><td><code>import-dlq.fifo</code> (14 days), <code>event-dlq</code> (14 days)</td><td>Crashed imports; undeliverable events</td></tr>
+  <tr><td>VPC</td><td>New; 2 public subnets, no NAT gateway; free S3 gateway endpoint</td><td>Network for the task</td></tr>
+  <tr><td>ECS cluster and service</td><td>Service <code>import-worker</code>, Fargate x86_64, 4 vCPU, 8 GiB, 30 GiB disk, desired count 0 to 1</td><td>Runs the worker</td></tr>
+  <tr><td>Auto scaling alarms</td><td><code>model-import-scale-out</code>, <code>model-import-scale-in</code></td><td>Start and stop the worker</td></tr>
+  <tr><td>Holding bucket</td><td>Name in output <code>HoldingBucketName</code>; <code>holding/</code> expires after 2 days, <code>state/</code> after 30 days</td><td>Downloads in progress; records and outcomes</td></tr>
+  <tr><td>Final bucket</td><td>Name in output <code>FinalBucketName</code>; no expiry on models</td><td>Stored models</td></tr>
+  <tr><td>IAM roles</td><td>Task role (least privilege; no <code>s3:*</code>, no <code>Resource: *</code>), execution role</td><td>Permissions</td></tr>
+  <tr><td>SES configuration set</td><td><code>model-import</code> (bounces and complaints go to the alert topic)</td><td>Failure emails</td></tr>
+  <tr><td>CloudWatch Logs</td><td>Log group <code>/model-import/worker</code>, 30 days</td><td>Application logs, metric filters</td></tr>
+  <tr><td>SNS topic and alarms</td><td><code>model-import-alerts</code>; alarms and rules listed in section 10.2</td><td>Alerts to the team mailbox</td></tr>
+  <tr><td>AWS Budget</td><td><code>model-import-monthly</code>, default 100 US dollars</td><td>Cost alert</td></tr>
+</table>
+<p class="small">Estimated cost in staging (from the design, not measured): the worker costs about 0.20 US dollars per hour of import; five one-hour imports a day is about 1 US dollar a day. Storage is about 0.40 US dollars a month for each 16 GB model kept. Queues, alarms, logs and SES are a few dollars a month. The estimate uses on-demand prices and should be checked on the AWS pricing page before the first deployment.</p>
+
+<!-- ============================ 3 ============================ -->
+<h2>3. Where everything is (code map)</h2>
+<p>All code is in the project folder <code>c:\Roshin\Kiro\Projects\model-download-scan</code>. Git is not installed on the build machine, so there is <b>no repository and no history yet</b>: the first step for the new owner is to create one (section 6).</p>
+
+<h3>Top-level layout</h3>
+<table>
+  <tr><th style="width:26%">Path</th><th>What it is</th></tr>
+  <tr><td><code>src/model_import/</code></td><td>The worker application (Python package <code>model_import</code>, 14 modules, about 4,600 lines)</td></tr>
+  <tr><td><code>infra/</code></td><td>The AWS CDK code: <code>config.py</code> (deployment settings) and <code>model_import_stack.py</code> (the whole stack)</td></tr>
+  <tr><td><code>app.py</code>, <code>cdk.json</code></td><td>CDK entry point (<code>python app.py</code>); default stack name <code>staging</code></td></tr>
+  <tr><td><code>tests/</code></td><td>540 automated tests in <code>unit/</code>, <code>integration/</code>, <code>e2e/</code>, <code>infra/</code></td></tr>
+  <tr><td><code>Dockerfile</code>, <code>.dockerignore</code></td><td>The container image of the worker; the build context holds only <code>pyproject.toml</code> and <code>src/</code></td></tr>
+  <tr><td><code>pyproject.toml</code></td><td>Package metadata, exact dependency pins, Black, Ruff, pytest and coverage settings</td></tr>
+  <tr><td><code>README.md</code></td><td>Operating guide: contract, settings, deploy, outcomes, records, recovery, limits</td></tr>
+  <tr><td><code>docs/handover/</code></td><td>This document (HTML source and PDF)</td></tr>
+  <tr><td><code>aidlc/</code></td><td>AI-DLC records: requirements, stories, designs, reviews, test results, CI design (section 12)</td></tr>
+  <tr><td><code>.venv/</code>, <code>cdk.out/</code></td><td>Local only (virtual environment, CDK output); not part of the deliverable</td></tr>
+  <tr><td><code>.gitignore</code>, <code>AGENTS.md</code>, <code>.kiro/</code></td><td>Git ignore rules; AI-DLC onboarding and engine files (tooling, not application code)</td></tr>
+</table>
+
+<h3>The application modules (<code>src/model_import/</code>)</h3>
+<table>
+  <tr><th style="width:20%">Module</th><th>What it does</th></tr>
+  <tr><td><code>worker.py</code></td><td>Program entry point (command <code>model-import-worker</code>). The queue loop: receive, heartbeat, task protection, 7-hour watchdog, SIGTERM handling, exit codes, builds the AWS clients with time-outs, deletes the message after the outcome exists</td></tr>
+  <tr><td><code>event.py</code></td><td>Reads and checks the start event (contract C1); classifies a message as a start event, a rejected event, or not a start event; checks file paths (including the reserved name <code>_COMPLETE</code>)</td></tr>
+  <tr><td><code>coordinator.py</code></td><td>The state machine of one import: front door, deadline checks, download, scan, keep, removal, email, the single outcome and the final record</td></tr>
+  <tr><td><code>hf_client.py</code></td><td>The only module that knows the Hugging Face web addresses: file listing, streaming download in 8 MiB chunks, speed floor, no token, certificate check</td></tr>
+  <tr><td><code>downloader.py</code></td><td>Downloads up to 4 files in parallel, enforces 1,000 files / 20 GiB, checks size and hash, uploads to the holding bucket</td></tr>
+  <tr><td><code>retry.py</code></td><td>Retry rule: 3 retries, waits 5/10/20 s, 30-minute budget, <code>Retry-After</code> up to 60 s; never waits past the deadline</td></tr>
+  <tr><td><code>scanner.py</code></td><td>The leak scanner (section 5)</td></tr>
+  <tr><td><code>custodian.py</code></td><td>All changes to the final location: marker reader, server-side copy (multipart above 5 GiB), <code>_COMPLETE</code> marker last, removal with proof by listing, leftovers</td></tr>
+  <tr><td><code>notifier.py</code></td><td>Builds and sends the emails (failure, rejection, already-stored); one email per recipient; daily limits; never includes a finding value</td></tr>
+  <tr><td><code>store.py</code></td><td>S3 access for <code>record.json</code>, the one-time <code>outcome.json</code> (conditional create), and the two daily email counters</td></tr>
+  <tr><td><code>deadline.py</code></td><td>The 6-hour <code>Deadline</code> value (injected clock) and the reason text "the time limit of 6 hours passed"</td></tr>
+  <tr><td><code>models.py</code></td><td>Data types: requests, file sets, findings, records, outcomes, leftovers; paths and the import id</td></tr>
+  <tr><td><code>logs.py</code></td><td>JSON logger with an allow-list of fields, so no secret or personal value can reach a log</td></tr>
+  <tr><td><code>settings.py</code></td><td>Reads the worker's settings from environment variables (section 4)</td></tr>
+</table>
+
+<h3>The tests (<code>tests/</code>)</h3>
+<table>
+  <tr><th style="width:20%">Folder</th><th>Contents</th></tr>
+  <tr><td><code>unit/</code></td><td>444 tests, one file per module (<code>test_coordinator.py</code>, <code>test_custodian.py</code>, ...), plus <code>test_rule_coverage.py</code>, which checks that every business rule ID (BR1.1 to BR11.3) is named by some test</td></tr>
+  <tr><td><code>integration/</code></td><td>19 tests of the worker loop with stand-in queue, storage and email</td></tr>
+  <tr><td><code>e2e/</code></td><td>7 end-to-end tests: event to outcome through the real code with stand-in services</td></tr>
+  <tr><td><code>infra/</code></td><td>70 CDK template tests (permissions, bucket settings, lifecycle rules, alarms)</td></tr>
+</table>
+
+<!-- ============================ 4 ============================ -->
+<h2>4. Inputs</h2>
+
+<h3>4.1 The start event (contract C1)</h3>
+<pre>{
+  "source": "model.import",
+  "detail-type": "ModelImportRequested",
+  "detail": {
+    "modelName": "owner/name",
+    "exactVersion": "&lt;40 characters of 0-9 and a-f&gt;",
+    "senderEmail": "person@example.com"
+  }
+}</pre>
+<table>
+  <tr><th style="width:22%">Field</th><th>Rule</th></tr>
+  <tr><td><code>modelName</code></td><td><code>owner/name</code>; letters, digits, dot, underscore and hyphen only. A name with one part (no <code>owner/</code>) is rejected</td></tr>
+  <tr><td><code>exactVersion</code></td><td>The full 40-character commit hash (lower-case hex), not a branch or tag</td></tr>
+  <tr><td><code>senderEmail</code></td><td>One plain email address. It receives the failure email, so it should be a real mailbox that SES may send to</td></tr>
+</table>
+<ul>
+  <li>An event that fails these checks is <b>rejected</b>: no download, an email naming the failed fields, outcome <code>rejected</code>.</li>
+  <li>A message that is not a start event at all (wrong source or detail-type, unreadable body) gets no email and no outcome. It is logged as <code>event_rejected</code> and deleted.</li>
+  <li>The sender needs permission to call <code>events:PutEvents</code> on the bus. The bus itself accepts only principals of the same account.</li>
+</ul>
+
+<h3>4.2 Limits on the model</h3>
+<table>
+  <tr><th style="width:30%">Limit</th><th>Value</th></tr>
+  <tr><td>Files per model version</td><td>At most 1,000 (checked before any download)</td></tr>
+  <tr><td>Total size</td><td>At most 20 GB (counted as 20 GiB so it fits the 30 GiB task disk)</td></tr>
+  <tr><td>Time</td><td>6 hours per import from the moment the worker takes the event; 7-hour watchdog as a backstop</td></tr>
+  <tr><td>Download speed</td><td>Average below 1 MB per second over 10 minutes fails the import with "the download is too slow"</td></tr>
+  <tr><td>Text file for the scan</td><td>Up to 200 MB and 5 minutes per file; a line over 1 MiB is scanned in overlapping windows</td></tr>
+  <tr><td>Hugging Face access</td><td>Public models only; no account and no token (any <code>HF_TOKEN</code> setting is ignored on purpose)</td></tr>
+</table>
+
+<h3>4.3 Deployment settings (what the owner supplies)</h3>
+<p>Pass each as CDK context (<code>-c name=value</code>) or as an environment variable. A context value wins. A missing or invalid setting stops <code>cdk synth</code> and names every problem at once, without echoing the values.</p>
+<table>
+  <tr><th style="width:20%">Setting</th><th style="width:30%">Environment variable</th><th>Notes</th></tr>
+  <tr><td><code>teamAddress</code></td><td><code>MODEL_IMPORT_TEAM_ADDRESS</code></td><td>Team mailbox. Gets every failure email and the alerts. <b>Required</b></td></tr>
+  <tr><td><code>senderAddress</code></td><td><code>MODEL_IMPORT_SENDER_ADDRESS</code></td><td>The "from" address of the emails. Must be verified in SES. <b>Required</b></td></tr>
+  <tr><td><code>breakGlassRoleArns</code></td><td><code>MODEL_IMPORT_BREAK_GLASS_ROLE_ARNS</code></td><td>Comma-separated IAM role ARNs of administrators who can still read the buckets (the bucket policies deny everyone else). <b>Required, at least one</b>; the stack refuses to build without it. Form: <code>arn:aws:iam::&lt;account-id&gt;:role/&lt;name&gt;</code></td></tr>
+  <tr><td><code>budgetLimitUsd</code></td><td><code>MODEL_IMPORT_BUDGET_LIMIT_USD</code></td><td>Monthly budget alert in US dollars. Default 100</td></tr>
+  <tr><td><code>stackName</code></td><td><code>MODEL_IMPORT_STACK_NAME</code></td><td>Letters, digits, hyphens. Default <code>staging</code> (also set in <code>cdk.json</code>)</td></tr>
+  <tr><td><code>smokeCheckRoleArn</code></td><td><code>MODEL_IMPORT_SMOKE_CHECK_ROLE_ARN</code></td><td>Optional. A role the pipeline's smoke check uses; it is added to the bucket-policy exemption list</td></tr>
+</table>
+
+<h3>4.4 The worker's own settings (set by the stack, not by you)</h3>
+<p>The CDK stack puts these into the container's environment. You only need them to run the worker by hand.</p>
+<table>
+  <tr><th style="width:42%">Variable</th><th>Meaning</th></tr>
+  <tr><td><code>MODEL_IMPORT_HOLDING_BUCKET</code></td><td>Holding bucket name (required)</td></tr>
+  <tr><td><code>MODEL_IMPORT_FINAL_BUCKET</code></td><td>Final bucket name (required)</td></tr>
+  <tr><td><code>MODEL_IMPORT_QUEUE_URL</code></td><td>Import queue URL (required)</td></tr>
+  <tr><td><code>MODEL_IMPORT_SENDER_ADDRESS</code>, <code>MODEL_IMPORT_TEAM_ADDRESS</code></td><td>The two mail addresses (required)</td></tr>
+  <tr><td><code>MODEL_IMPORT_SES_CONFIGURATION_SET</code></td><td>Optional SES configuration set name</td></tr>
+  <tr><td><code>AWS_REGION</code></td><td>Defaults to <code>us-east-1</code></td></tr>
+</table>
+<p>The worker needs <b>no password, key or token</b>. It uses the task role of AWS Fargate for AWS access.</p>
+
+<!-- ============================ 5 ============================ -->
+<h2>5. What the scan checks</h2>
+<p>Any single finding fails the whole import. There is no way to accept a finding in this version. A finding records the file name, the place, and the kind. It never records the matched text, any part of it, or the text around it.</p>
+<table>
+  <tr><th style="width:22%">File class</th><th>Which files</th><th style="width:30%">What happens</th></tr>
+  <tr><td>Text and settings</td><td>Endings <code>json, jsonl, txt, md, yaml, yml, py, jinja, toml, cfg, ini, csv, tiktoken</code>, and files with no ending</td><td>Read in 1 MiB parts and searched with the patterns below</td></tr>
+  <tr><td>Weight (allowed)</td><td><code>.safetensors</code></td><td>Content not scanned; the header length and header are checked</td></tr>
+  <tr><td>Weight (not allowed)</td><td><code>bin, pt, pth, pkl, pickle, ckpt, h5, onnx, gguf, msgpack, npz</code></td><td>A finding "disallowed weight type" (these formats can carry executable code or cannot be read safely)</td></tr>
+  <tr><td>Other endings</td><td>Anything else</td><td>Kept, not scanned (an owner decision recorded in the design)</td></tr>
+</table>
+<p><b>Patterns</b> (the smallest set for the first version; a pattern may be added, none removed): cloud access keys (<code>AKIA</code>/<code>ASIA</code> keys), private key blocks, tokens (for example <code>hf_</code>, <code>ghp_</code>, <code>github_pat_</code>, <code>xoxb-</code>, <code>sk-</code>, and JSON web tokens), passwords and secrets assigned in text, email addresses, phone numbers, government-ID-style numbers (nnn-nn-nnnn), and street addresses. Up to 100 findings are recorded per file.</p>
+
+<!-- ============================ 6 ============================ -->
+<h2>6. Prerequisites before the first deployment</h2>
+<p>None of these exists yet. They are the owner's to arrange.</p>
+<table>
+  <tr><th style="width:5%">#</th><th style="width:45%">Prerequisite</th><th>Notes</th></tr>
+  <tr><td>1</td><td>A Git repository on a hosting service, with a main branch</td><td>Install Git, run <code>git init</code>, commit. The team works on one main branch and commits small changes often. Do not commit <code>.venv</code> or <code>cdk.out</code> (already in <code>.gitignore</code>)</td></tr>
+  <tr><td>2</td><td>An AWS account and a way to sign in from the machine that deploys</td><td>The common AWS account in us-east-1. Use a role or SSO session, not long-lived keys</td></tr>
+  <tr><td>3</td><td>Tools on the deploying machine</td><td>Python 3.12+, Node.js (installed here: 24.19.0) and npm, the AWS CDK command line (<code>npm install -g aws-cdk</code>), the AWS CLI, and <b>Docker</b> (CDK builds the image at deploy time)</td></tr>
+  <tr><td>4</td><td><code>cdk bootstrap</code> of the account in us-east-1</td><td>One time. Creates the asset repository and roles that the deployment uses</td></tr>
+  <tr><td>5</td><td>Email set up in Amazon SES (us-east-1)</td><td>Verify the sender address (<code>senderAddress</code>). While SES is in the sandbox, also verify the team mailbox and any sender addresses that will receive mail, or ask AWS for production access</td></tr>
+  <tr><td>6</td><td>Break-glass administrator role ARN(s)</td><td>At least one. Without one the stack will not build</td></tr>
+  <tr><td>7</td><td>The team mailbox that will receive alerts</td><td>After the first deployment, click the confirmation link SNS sends to it</td></tr>
+  <tr><td>8</td><td>A small public Hugging Face model for the first test</td><td>Within the limits in section 4.2 (small enough to download in minutes). Note its 40-character commit hash</td></tr>
+  <tr><td>9</td><td>A CI platform (optional for a manual first deployment)</td><td>Design: AWS CodePipeline with CodeBuild (section 11). Not built yet</td></tr>
+</table>
+
+<!-- ============================ 7 ============================ -->
+<h2>7. Install and check the code on a developer machine</h2>
+<p>Python 3.12 or newer is needed. The tests on the build machine ran on Python 3.13.2; the target is 3.12, so run them once on 3.12 as well.</p>
+<pre># Windows PowerShell, from the project folder
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev]"</pre>
+<p>On macOS or Linux, activate with <code>source .venv/bin/activate</code>. The <code>dev</code> extra installs the test tools and the CDK library at the exact versions pinned in <code>pyproject.toml</code>.</p>
+
+<h3>Checks</h3>
+<pre>python -m pytest --cov --cov-fail-under=80      # the project check; takes several minutes
+black --check src infra tests app.py              # formatting
+ruff check src infra tests app.py                 # lint
+pip-audit --local                                 # known vulnerabilities in installed packages</pre>
+<ul>
+  <li>The pytest command is the project check. It fails below 80 percent line coverage. The tests need no AWS account and no network: S3, SQS, SES and Hugging Face are stand-ins (moto and respx). Last result: <b>540 passed, coverage 95.88%</b>.</li>
+  <li>Black and Ruff were clean on all 44 files at the last run.</li>
+  <li><code>pip-audit</code> showed 12 findings, all in <code>pip</code> 24.3.1 inside the local virtual environment and none in the pinned project packages. Upgrade <code>pip</code> first and re-run.</li>
+</ul>
+
+<!-- ============================ 8 ============================ -->
+<h2>8. Package and deploy</h2>
+
+<h3>8.1 How the application is packaged</h3>
+<ul>
+  <li><b>Python package:</b> <code>pip install .</code> installs the <code>model_import</code> package and the command <code>model-import-worker</code> (entry point <code>model_import.worker:main</code>).</li>
+  <li><b>Container image:</b> built from the <code>Dockerfile</code> at the project root. Base image <code>python:3.12-slim</code> (the build argument <code>BASE_IMAGE</code> can replace it), runs as the non-root user <code>worker</code>, entry point <code>model-import-worker</code>. Only <code>pyproject.toml</code> and <code>src/</code> go into the build context (<code>.dockerignore</code>).</li>
+  <li><b>You do not push the image yourself.</b> <code>cdk deploy</code> builds it (platform linux/amd64) and publishes it to the repository that <code>cdk bootstrap</code> created, then points the Fargate task at it. This needs Docker running on the deploying machine.</li>
+</ul>
+<p>To try the image build on its own (not yet done on any machine):</p>
+<pre>docker build -t model-import:local .</pre>
+<div class="note">The stack builds the image without passing a base-image digest, so every build starts from the tag <code>python:3.12-slim</code> and the base image can change between builds. Pinning it by digest needs a small stack change (add <code>build_args</code> in <code>infra/model_import_stack.py</code>, function <code>_asset_image</code>).</div>
+
+<h3>8.2 First deployment, step by step</h3>
+<ol>
+  <li><b>Sign in to the AWS account</b> (for example <code>aws sso login --profile &lt;profile&gt;</code>) and select us-east-1.</li>
+  <li><b>Install the CDK command line:</b> <code>npm install -g aws-cdk</code>.</li>
+  <li><b>Bootstrap once:</b>
+    <pre>cdk bootstrap aws://&lt;account-id&gt;/us-east-1</pre></li>
+  <li><b>Set the deployment settings.</b> Either in the environment:
+    <pre>$env:MODEL_IMPORT_TEAM_ADDRESS = "team@example.com"
+$env:MODEL_IMPORT_SENDER_ADDRESS = "sender@example.com"
+$env:MODEL_IMPORT_BREAK_GLASS_ROLE_ARNS = "arn:aws:iam::&lt;account-id&gt;:role/&lt;admin-role&gt;"</pre>
+    or as <code>-c</code> options on the commands below.</li>
+  <li><b>Look before you deploy.</b> Synthesis shows the template and any setting problem:
+    <pre>cdk synth
+cdk diff</pre></li>
+  <li><b>Deploy:</b>
+    <pre>cdk deploy</pre>
+    It prints the IAM changes for approval. The first deployment builds the image, which takes a few minutes. Keep the stack outputs: <code>EventBusName</code>, <code>ImportQueueUrl</code>, <code>HoldingBucketName</code>, <code>FinalBucketName</code>, <code>AlertTopicArn</code>.</li>
+  <li><b>Confirm the SNS subscription:</b> open the email SNS sent to the team mailbox and click the link. Until then no alert reaches anyone.</li>
+  <li><b>Check SES:</b> the sender identity must be verified, and while in the sandbox the recipients too. Send a test email from the console to the team mailbox.</li>
+  <li><b>(Optional) activate the cost allocation tag <code>app</code></b> once in the Billing console so the budget is filtered to this application. Until then it measures the whole account.</li>
+  <li><b>Run the first import with a small model</b> (section 9) and watch the logs.</li>
+</ol>
+
+<h3>8.3 Deploying a change</h3>
+<ol>
+  <li>Make the change; run the checks in section 7 (all must pass).</li>
+  <li>Make sure no import is running: the service desired count is 0 and the queue is empty (the deployment sets maximum healthy percent to 100, so a new task is never started beside a running one, and a running import is protected from being stopped).</li>
+  <li>Run <code>cdk diff</code>, then <code>cdk deploy</code>. CloudFormation rolls back a failed update by itself; the buckets are never touched by a rollback.</li>
+  <li>Send a test event for a small model.</li>
+</ol>
+<div class="note"><b>Removing the stack.</b> Both buckets have a "retain" removal policy, so <code>cdk destroy</code> leaves them (and the models) in place. Delete them by hand only on purpose.</div>
+
+<!-- ============================ 9 ============================ -->
+<h2>9. Run it: send an event and read the results</h2>
+<h3>9.1 Send a test event</h3>
+<p>Use a small public model. The hash below is only an example: use the real 40-character commit hash of the version you want.</p>
+<pre>aws events put-events --region us-east-1 --entries file://event.json</pre>
+<p>with <code>event.json</code>:</p>
+<pre>[
+  {
+    "EventBusName": "model-import",
+    "Source": "model.import",
+    "DetailType": "ModelImportRequested",
+    "Detail": "{\"modelName\":\"owner/name\",\"exactVersion\":\"0123456789abcdef0123456789abcdef01234567\",\"senderEmail\":\"person@example.com\"}"
+  }
+]</pre>
+<p>The first task starts about 3 minutes after the event reaches the queue. A clean small model should end in <code>stored</code> within minutes; a 16 GB model is expected to take about an hour (a design target, not yet measured).</p>
+
+<h3>9.2 Read the result</h3>
+<ol>
+  <li><b>Logs:</b> CloudWatch log group <code>/model-import/worker</code>. Every line is one JSON object. The result line is <code>"event": "import_outcome"</code>. Example Logs Insights query for one import:
+    <pre>fields @timestamp, event, status, step, outcome, reason
+| filter importId = "imp-..."
+| sort @timestamp asc</pre></li>
+  <li><b>The final bucket:</b> a stored model is at <code>models/&lt;lower-case owner/name&gt;/&lt;exactVersion&gt;/&lt;path&gt;</code>. It is complete only if <code>_COMPLETE</code> exists in that folder. Read only the files the marker lists.</li>
+  <li><b>The record and the outcome</b> in the holding bucket under <code>state/&lt;importId&gt;/</code> (section 10.3).</li>
+  <li><b>Email:</b> failures email the team mailbox and the sender.</li>
+</ol>
+<p>The marker is JSON: <code>importId</code>, <code>modelName</code>, <code>exactVersion</code>, <code>files</code> (each with <code>path</code> and <code>sizeBytes</code>), and <code>completedAt</code>. It holds no sender address.</p>
+
+<!-- ============================ 10 ============================ -->
+<h2>10. Operate: alerts, logs, records, and recovery</h2>
+
+<h3>10.1 The five outcomes</h3>
+<table>
+  <tr><th style="width:21%">Outcome</th><th>What happened</th><th style="width:34%">What it means for you</th></tr>
+  <tr><td><code>stored</code></td><td>Scan clean, every file copied, marker written</td><td>The model is in the final bucket. No email. It may carry <code>removalComplete: false</code> if the holding folder could not be fully deleted (alert b fires; remove the leftovers by hand)</td></tr>
+  <tr><td><code>removed-with-email</code></td><td>The import failed (download problem, finding, time limit, failed copy, other step). Everything was removed and every email was accepted</td><td>The sender and team were told why. Nothing should be left</td></tr>
+  <tr><td><code>removed-email-failed</code></td><td>Failed and removed, but at least one email was not accepted (SES refused it or a daily limit was reached)</td><td>Files are removed, but someone may not know. Read <code>emailSent</code> and <code>recipientsNotReached</code> in the outcome. Alert (a) fires</td></tr>
+  <tr><td><code>rejected</code></td><td>The start event had a missing or malformed field. Nothing was downloaded</td><td>An email names the failed fields (never values). Send a corrected event</td></tr>
+  <tr><td><code>refused-already-stored</code></td><td>That model version already has a <code>_COMPLETE</code> marker from another import, or a marker that cannot be read</td><td>No new import is needed. The sender and team were told</td></tr>
+</table>
+<p>Once the <code>_COMPLETE</code> marker is written, nothing that follows can remove the model or change its outcome from <code>stored</code>.</p>
+
+<h3>10.2 Alerts</h3>
+<p>All alarms notify the SNS topic <code>model-import-alerts</code> (the team mailbox). Alarm names are as created in the stack.</p>
+<table>
+  <tr><th style="width:11%">Alert</th><th style="width:34%">Name</th><th>Fires when, and what to do</th></tr>
+  <tr><td>(a)</td><td><code>model-import-a-failure-email-not-sent</code></td><td>An email did not reach everyone (<code>emailSent = false</code>). Open the import's outcome; tell the people concerned by hand</td></tr>
+  <tr><td>(b)</td><td><code>model-import-b-removal-not-complete</code></td><td>Files of a failed import may still be in the buckets (<code>removalComplete = false</code>). Remove them by hand (the failure email lists up to 20 leftovers; the logs have one <code>leftover</code> line each)</td></tr>
+  <tr><td>(c)</td><td>rule <code>model-import-c-worker-stopped</code></td><td>A worker task stopped with a non-zero exit code or failed to start (for example an image pull error). Look at the task's stop reason and the logs</td></tr>
+  <tr><td>(d)</td><td><code>model-import-d-event-dead-letter-queue</code>, <code>model-import-d-import-dead-letter-queue</code>, <code>model-import-d-import-dead-letter-reminder</code></td><td>A start event could not be queued, or an import stopped unexpectedly (message in <code>import-dlq.fifo</code>); the reminder repeats after 60 minutes. See 10.4</td></tr>
+  <tr><td>(e)</td><td><code>model-import-e-email-limit-reached</code></td><td>A daily email limit was reached (30 failure emails, or 20 rejection/already-stored emails, per UTC day). Find the cause (often a burst of bad events)</td></tr>
+  <tr><td>(f)</td><td>SES configuration set <code>model-import</code></td><td>A bounce or complaint. Check the sender and recipient addresses</td></tr>
+  <tr><td>stuck</td><td><code>model-import-stuck-oldest-message</code></td><td>The oldest message in the queue is over 10 hours old (a message can wait up to 7 hours behind a running import). Check the worker and the scale-out alarm</td></tr>
+  <tr><td>cost</td><td>Budget <code>model-import-monthly</code></td><td>Monthly spend reached the limit (default 100 US dollars)</td></tr>
+</table>
+
+<h3>10.3 Reading a record and an outcome</h3>
+<p>Both are JSON objects in the holding bucket under <code>state/&lt;importId&gt;/</code>. They are history only (nothing reads them to decide what to do next) and expire after 30 days. The <code>importId</code> is <code>imp-</code> followed by the first 32 hex characters of the SHA-256 of the event id that the bus gave the event:</p>
+<pre>python -c "import hashlib,sys; print('imp-' + hashlib.sha256(sys.argv[1].encode('utf-8')).hexdigest()[:32])" &lt;eventId&gt;</pre>
+<table>
+  <tr><th style="width:26%">Object</th><th>Key fields</th></tr>
+  <tr><td><code>record.json</code> (rewritten before each step)</td><td><code>status</code> and <code>step</code> (downloading, scanning, keeping, removing, done), <code>modelName</code>, <code>exactVersion</code>, <code>startedAt</code>, <code>updatedAt</code>, <code>filesCopied</code>, <code>lastKeyCopied</code>, <code>outcome</code>, <code>failureReason</code>, <code>findings</code> (at most 200; file name, place, kind; never values), <code>findingsTotal</code></td></tr>
+  <tr><td><code>outcome.json</code> (written once, never changed)</td><td><code>outcome</code>, <code>removalComplete</code>, <code>finishedAt</code>, <code>failureReason</code>, <code>emailSent</code>, <code>recipientsNotReached</code> (roles <code>sender</code>/<code>team</code>, never addresses)</td></tr>
+</table>
+<p>If the outcome object exists, the import is finished; receiving the same message again does nothing.</p>
+
+<h3>10.4 When an import stops unexpectedly</h3>
+<p>If the worker stops in the middle of an import (task stopped, the 7-hour watchdog, a fatal error), the import is <b>not cleaned up by itself</b>. The message moves to <code>import-dlq.fifo</code> and alerts (d) fire. A person recovers it:</p>
+<ol>
+  <li>Compute the <code>importId</code> and read <code>state/&lt;importId&gt;/record.json</code>. If <code>outcome.json</code> exists, nothing needs recovery.</li>
+  <li>If the step was <code>keeping</code> or <code>removing</code>, look in the final bucket under <code>models/&lt;owner/name&gt;/&lt;version&gt;/</code>. A folder <b>without</b> <code>_COMPLETE</code> is not a stored model; its files never expire, so remove them by hand or run the import again.</li>
+  <li>If the folder has a <code>_COMPLETE</code> whose <code>importId</code> is the one you are recovering, the model is stored; redriving the message finishes it as <code>stored</code> with no email.</li>
+  <li>Files under <code>holding/&lt;importId&gt;/</code> expire after 2 days; unfinished uploads are aborted after 1 day.</li>
+  <li>Fix the cause, then in the SQS console open <code>import-dlq.fifo</code> and choose "Start DLQ redrive". A redriven message gets a new 6-hour clock.</li>
+</ol>
+<p>A failed import that ended with an email is recovered by sending the same start event again after the cause is fixed. If the email says the removal was not complete, remove the listed leftovers by hand.</p>
+
+<h3>10.5 Limits worth knowing</h3>
+<ul>
+  <li><b>Email limits</b> (per UTC day, fixed in the code): 30 failure emails and 20 rejection/already-stored emails. Past the limit no email is sent, the event still ends with its outcome, and alert (e) fires.</li>
+  <li><b>The 6-hour limit</b> is checked before each step and each file, at every download chunk, and at every part of a large copy. One copy call of up to 5 GiB, the scan of one text file (5 minutes), the removal, and the email cannot be interrupted, so the design aims at the import having stopped within 10 minutes after the deadline. It is never checked after the marker is written.</li>
+  <li><b>One import at a time.</b> Other events wait in the queue. A second event for a model version that waits behind the first is refused once the first has stored it.</li>
+  <li>The limits and the email limits are constants in the code, not settings.</li>
+</ul>
+
+<!-- ============================ 11 ============================ -->
+<h2>11. What has not been verified, known limits, and open items</h2>
+
+<div class="warn"><b>Not verified anywhere:</b> a deployment to AWS; the container image build (Docker is not installed on the build machine); <code>cdk synth</code> through the CDK command line (synthesis was run through <code>python app.py</code> and the CDK template tests); SES sending, the sandbox status and the verified identities; a real Hugging Face download; real timing for a 16 GB model; the copy of a file above 5 GiB in parts (tested with a stand-in because the S3 stand-in rejects the small parts needed); a Python 3.12 run (tests ran on 3.13.2); any CI pipeline.</div>
+
+<h3>11.1 Build and Test result</h3>
+<p>All build and test commands that could run passed (540 tests, 95.88% coverage, Black, Ruff, synthesis). Of 108 quality targets, 85 are met, 3 not met, 19 unverified, 1 not applicable (belongs to CI). The person accepted this at the Build and Test gate. The details are in <code>aidlc/.../construction/build-and-test/build-and-test-summary.md</code>.</p>
+<table>
+  <tr><th style="width:30%">Target</th><th>State</th><th style="width:32%">What it would take</th></tr>
+  <tr><td>Changed-module coverage of 90%: <code>worker.py</code> 89.77%, <code>store.py</code> 88.64%</td><td>Not met (project total is far above the 80% floor)</td><td>A few more tests</td></tr>
+  <tr><td>Stuck-queue alarm at 10 hours (design said 8)</td><td>Not met by wording; chosen on purpose, because a message can wait 7 hours behind a running import</td><td>Accept the 10 hours as the target</td></tr>
+  <tr><td>Task role lists whole buckets (design said by prefix)</td><td>Not met by wording; chosen on purpose so a missing object returns "not found", not "forbidden"</td><td>Accept as the target</td></tr>
+  <tr><td>Real import timing (16 GB in 1 hour, 20 MB/s, scan 10 min, keep 15 min), staged run of a 10 GB+ model</td><td>Unverified</td><td>A real run in the account</td></tr>
+  <tr><td>SES sandbox and identities</td><td>Unverified</td><td>The readiness script described in the CI design</td></tr>
+  <tr><td>Image build; secret scan in CI</td><td>Unverified</td><td>Docker; the CI pipeline</td></tr>
+  <tr><td>Tests missing for: removal beside a sibling version folder; the 100-match cap log line; 1,000-file removal; a burst of 100 bad events; durations; chunk/part constants</td><td>Unverified</td><td>About 20 more tests (offered at the Build and Test gate, not taken)</td></tr>
+</table>
+
+<h3>11.2 Open items for the new owner</h3>
+<table>
+  <tr><th style="width:5%">#</th><th>Item</th><th style="width:38%">Notes</th></tr>
+  <tr><td>1</td><td>Create the Git repository and make the first commit</td><td>No history exists; the baseline for the changed Unit 1 tests was lost</td></tr>
+  <tr><td>2</td><td>Write the CI/CD pipeline</td><td>Design only, in <code>aidlc/.../construction/ci-pipeline/ci-config.md</code> and <code>quality-gates.md</code>: AWS CodePipeline with CodeBuild defined in CDK; runs on every push to main; gates: Black, Ruff, tests at 80%, <code>pip-audit</code>, Gitleaks, CDK template tests, Trivy image scan; then readiness check, wait for idle, deploy to staging, smoke check. The pipeline code is not in the repository</td></tr>
+  <tr><td>3</td><td>Decide on pinning the base image by digest</td><td>Needs a one-line stack change (section 8.1)</td></tr>
+  <tr><td>4</td><td>The smoke-check role</td><td>The stack only accepts its ARN (<code>smokeCheckRoleArn</code>); the role and its grants (put events, list both buckets, read the final bucket, delete the test model) would be created by the pipeline stack</td></tr>
+  <tr><td>5</td><td>Small wording fixes the reviewer found</td><td>(a) README recovery step 2 says "see step 4" for sending the event again; it should say step 5. (b) The failure email says the final location "may hold a complete copy" when the marker could not be checked; the files may be only partial in that case</td></tr>
+  <tr><td>6</td><td>Documents that disagree with the code</td><td>The NFR documents write log event names with dots (<code>import.outcome</code>); the code and the stack use underscores (<code>import_outcome</code>). Earlier design documents that need small corrections are listed in <code>aidlc/.../u2-import-rules/functional-design/functional-spec.md</code>, "Corrections to Earlier Documents"</td></tr>
+  <tr><td>7</td><td>A production stack</td><td>Not in the first version. The same code with another stack name; the fixed resource names mean it needs its own account or Region</td></tr>
+</table>
+
+<h3>11.3 Known limits of the product</h3>
+<ul>
+  <li>Single-name models (no <code>owner/</code>) are rejected. Any finding fails the whole import. Files with unknown endings are kept without being scanned.</li>
+  <li>An unexpected stop is recovered by a person, not automatically.</li>
+  <li>Only the Region us-east-1 and one stack per account are supported (fixed resource names).</li>
+  <li>The earlier idea of a 140 GB model path was dropped: this version is for smaller models.</li>
+</ul>
+
+<!-- ============================ 12 ============================ -->
+<h2>12. Reference</h2>
+
+<h3>12.1 Names and numbers at a glance</h3>
+<table>
+  <tr><th style="width:34%">Item</th><th>Value</th></tr>
+  <tr><td>Event source / detail type</td><td><code>model.import</code> / <code>ModelImportRequested</code></td></tr>
+  <tr><td>Bus / rule / queue / dead-letter queues</td><td><code>model-import</code> / <code>start-import</code> / <code>import-queue.fifo</code> / <code>import-dlq.fifo</code>, <code>event-dlq</code></td></tr>
+  <tr><td>ECS service / worker command</td><td><code>import-worker</code> / <code>model-import-worker</code></td></tr>
+  <tr><td>Log group / metric namespace</td><td><code>/model-import/worker</code> (30 days) / <code>ModelImport</code></td></tr>
+  <tr><td>Alert topic / SES configuration set</td><td><code>model-import-alerts</code> / <code>model-import</code></td></tr>
+  <tr><td>Cost-allocation tag</td><td><code>app = model-import-scan</code>, <code>env = staging</code></td></tr>
+  <tr><td>Holding bucket layout</td><td><code>holding/&lt;importId&gt;/...</code> (2 days), <code>state/&lt;importId&gt;/record.json</code> and <code>outcome.json</code>, <code>state/counters/...</code> (30 days)</td></tr>
+  <tr><td>Final bucket layout</td><td><code>models/&lt;lower-case owner/name&gt;/&lt;exactVersion&gt;/&lt;path&gt;</code> and <code>.../_COMPLETE</code></td></tr>
+  <tr><td>Retries / waits / budget</td><td>3 retries per file; 5, 10, 20 s; 30 min total; <code>Retry-After</code> up to 60 s</td></tr>
+  <tr><td>Queue timing</td><td>Visibility 15 min, heartbeat every 5 min, watchdog 7 h, deadline 6 h</td></tr>
+  <tr><td>Parallelism / parts</td><td>4 files at a time; 8 MiB download chunks; 32 MiB upload parts; server-side copy in parts above 5 GiB</td></tr>
+  <tr><td>Email limits</td><td>30 failure emails/day, 20 rejection and already-stored emails/day (UTC day)</td></tr>
+  <tr><td>Pinned key dependencies</td><td><code>boto3 1.43.123</code>, <code>httpx 0.28.1</code>; dev: <code>pytest 9.2.0</code>, <code>moto 5.2.5</code>, <code>respx 0.23.1</code>, <code>black 26.10.1</code>, <code>ruff 0.17.3</code>, <code>aws-cdk-lib 2.275.0</code></td></tr>
+</table>
+
+<h3>12.2 Where the design records are</h3>
+<p>All under <code>aidlc/spaces/default/intents/261030-model-import-scan/</code>:</p>
+<table>
+  <tr><th style="width:38%">Folder or file</th><th>What it holds</th></tr>
+  <tr><td><code>ideation/</code></td><td>Intent statement, feasibility, scope document</td></tr>
+  <tr><td><code>inception/</code></td><td>Requirements, user stories, domain design, units, contracts (<code>contract-design/contract-summary.md</code>), delivery plan</td></tr>
+  <tr><td><code>construction/u1-import-slice/</code></td><td>Unit 1 (the end-to-end slice): functional design, NFRs, infrastructure design (<code>infrastructure-design/</code>, including <code>cicd-pipeline.md</code> and <code>monitoring-design.md</code>), <code>code-generation/code-summary.md</code></td></tr>
+  <tr><td><code>construction/u2-import-rules/</code></td><td>Unit 2 (the rules: rejection, deadline, all-or-nothing move, five outcomes, records): the same set of documents; <code>functional-design/functional-spec.md</code> and <code>rules.md</code> (rules BR6.1 to BR11.3)</td></tr>
+  <tr><td><code>construction/build-and-test/</code></td><td>Build instructions, integration test instructions, test results, the target matrix, cross-unit traceability</td></tr>
+  <tr><td><code>construction/ci-pipeline/</code></td><td>CI design: <code>ci-config.md</code>, <code>quality-gates.md</code></td></tr>
+  <tr><td><code>verification/</code></td><td>Phase checks (inception, construction)</td></tr>
+  <tr><td><code>aidlc-state.md</code>, <code>audit/</code></td><td>Workflow state and the decision log</td></tr>
+  <tr><td><code>aidlc/spaces/default/memory/</code></td><td>Team rules: one main branch, test-after, 80% coverage, Black and Ruff, no secrets in code or logs</td></tr>
+</table>
+
+<h3>12.3 Security design in brief</h3>
+<ul>
+  <li>No secrets: the worker needs no password, key or token; nothing sensitive is in code or logs (the logger writes only allow-listed fields; findings never include matched text).</li>
+  <li>Hugging Face is reached over HTTPS only with certificate checks and no credentials; downloaded files are checked for size and hash.</li>
+  <li>Both buckets are private, encrypted, TLS 1.2 or higher only, and object access is denied to everyone except the task role, the CDK roles and the break-glass roles (and the optional smoke-check role).</li>
+  <li>The event bus accepts events only from principals of the same account; the queue accepts messages only from the bus rule.</li>
+  <li>The task role has no <code>s3:*</code> and no <code>Resource: *</code>; the template tests check this.</li>
+  <li>Emails never contain a matched value, and the sender's address is never written to a log, record, outcome or marker.</li>
+</ul>
+
+<p class="small" style="margin-top:18pt">End of handover document. Generated from the project files on 2 November 2026. If this document and the code disagree, the code and the records under <code>aidlc/</code> are the source of truth.</p>
+
+</body>
+</html>
